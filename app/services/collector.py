@@ -1,11 +1,17 @@
 import asyncio
+import logging
 import os
 import threading
+import time
 from typing import List, Tuple
+
+from playwright.sync_api import Error as PlaywrightError
 
 from app.schemas.jobs import Job, SearchQuery
 from app.services.cache import search_cache
-from app.services.naukri import NaukriService
+from app.services.naukri import NaukriService, NaukriUpstreamError
+
+logger = logging.getLogger(__name__)
 
 
 class CollectionService:
@@ -15,11 +21,10 @@ class CollectionService:
         self.naukri = NaukriService()
         self._locks = {}
         self._locks_guard = threading.Lock()
-        # Multiple Chromium instances are a common source of Hobby-container
-        # instability. Default to one live collector; cache hits never wait.
         self._live_slots = threading.BoundedSemaphore(
             max(1, int(os.getenv("MAX_LIVE_COLLECTORS", "1")))
         )
+        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "1")))
 
     def _lock_for(self, query: SearchQuery) -> threading.Lock:
         key = search_cache.key(query)
@@ -27,6 +32,34 @@ class CollectionService:
             if key not in self._locks:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
+
+    def _run_live_with_retry(self, query: SearchQuery):
+        """Retry only transient browser/runtime failures.
+
+        Each NaukriService search creates and closes its own BrowserManager, so a
+        retry gets a completely fresh Playwright process/context. We deliberately
+        do not retry application/programming errors indefinitely.
+        """
+        last_error = None
+        for attempt in range(self.browser_retries + 1):
+            try:
+                return self.naukri._search_sync(query)
+            except NaukriUpstreamError:
+                # NaukriService already performs its own bounded empty-page retry.
+                raise
+            except PlaywrightError as exc:
+                last_error = exc
+                logger.warning(
+                    "Transient Playwright collector failure attempt=%s/%s query=%s: %s",
+                    attempt + 1,
+                    self.browser_retries + 1,
+                    query,
+                    exc,
+                )
+                if attempt >= self.browser_retries:
+                    raise
+                time.sleep(0.2)
+        raise last_error  # pragma: no cover
 
     def _collect_sync(self, query: SearchQuery) -> Tuple[List[Job], int, str]:
         cached = search_cache.get(query)
@@ -41,24 +74,19 @@ class CollectionService:
                 jobs, total = cached
                 return jobs, total, "cache"
 
-            # If another live collection is already consuming Chromium, prefer
-            # stale data for this query rather than queueing a customer behind it.
             if not self._live_slots.acquire(blocking=False):
                 stale = search_cache.get(query, allow_stale=True)
                 if stale is not None:
                     jobs, total = stale
                     return jobs, total, "stale-cache"
-                # No prior data exists, so wait for the one bounded slot instead
-                # of launching another browser and risking container exhaustion.
                 self._live_slots.acquire()
             try:
-                # A previous waiter may have populated this exact query.
                 cached = search_cache.get(query)
                 if cached is not None:
                     jobs, total = cached
                     return jobs, total, "cache"
                 try:
-                    jobs, total = self.naukri._search_sync(query)
+                    jobs, total = self._run_live_with_retry(query)
                     search_cache.set(query, (jobs, total))
                     return jobs, total, "live"
                 except Exception:
