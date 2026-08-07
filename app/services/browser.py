@@ -7,8 +7,8 @@ class BrowserManager:
     """Playwright wrapper using an ephemeral anonymous browser context.
 
     No Naukri credentials, cookies, storage state, or persistent browser profile
-    are loaded. Set NAUKRI_HEADLESS=false only for local diagnostic runs where
-    you want to visibly inspect the page Naukri returns.
+    are loaded. Set NAUKRI_HEADLESS=false for the Xvfb-backed production-style
+    browser used by Docker/Railway.
     """
 
     def __init__(self):
@@ -29,7 +29,6 @@ class BrowserManager:
             headless = self.configured_headless(default=True)
 
         self.playwright = sync_playwright().start()
-
         launch_options = {"headless": headless}
         executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
         if executable_path:
@@ -47,9 +46,25 @@ class BrowserManager:
         return self.page
 
     def close(self):
+        # Cleanup must never turn an otherwise successful collection into a
+        # public 503. Browser/context may already be closed by Chromium after a
+        # long multi-page scan, so every resource is best-effort independently.
         if self.context:
-            self.context.close()
+            try:
+                self.context.close()
+            except Exception:
+                pass
         if self.browser:
-            self.browser.close()
+            try:
+                self.browser.close()
+            except Exception:
+                pass
         if self.playwright:
-            self.playwright.stop()
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+        self.page = None
+        self.context = None
+        self.browser = None
+        self.playwright = None
