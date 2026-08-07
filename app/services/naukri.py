@@ -21,7 +21,7 @@ class NaukriUpstreamError(Exception):
 
 class NaukriService:
     MAX_PAGES = 10
-    FILTER_SCAN_PAGES = 4
+    FILTER_SCAN_PAGES = 3
     NAUKRI_PAGE_SIZE = 20
     MAX_LIMIT = 100
     EMPTY_PAGE_RETRIES = 1
@@ -78,11 +78,6 @@ class NaukriService:
 
     @staticmethod
     def _extract_cards(page):
-        """Extract card fields in one browser->Python round trip.
-
-        The old parser made many locator/count/text calls per card. On Railway
-        those IPC round trips dominated filtered and 50/100-result requests.
-        """
         return page.evaluate("""
         (selectors) => {
           const pick = (root, sels) => {
@@ -127,11 +122,14 @@ class NaukriService:
     def _navigate_cards(self, page, url):
         last_preview = None
         for attempt in range(self.EMPTY_PAGE_RETRIES + 1):
-            response = page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=15000)
             if response is not None and response.status >= 400:
                 raise NaukriUpstreamError("Naukri search page returned HTTP {}".format(response.status), status_code=response.status, response_preview=self._page_snapshot(page))
             try:
-                page.wait_for_function("() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0", timeout=4500)
+                # Cards are normally present immediately after DOMContentLoaded.
+                # Keep this short so a slow/empty upstream page does not add 4.5s
+                # to every filtered scan.
+                page.wait_for_function("() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0", timeout=2000)
             except Exception:
                 pass
             self._detect_challenge(page)
@@ -140,7 +138,7 @@ class NaukriService:
                 return cards
             last_preview = self._page_snapshot(page)
             if attempt < self.EMPTY_PAGE_RETRIES:
-                page.wait_for_timeout(350)
+                page.wait_for_timeout(200)
         raise NaukriUpstreamError("Naukri returned no recognizable job cards", response_preview=last_preview)
 
     def _search_sync(self, query):
