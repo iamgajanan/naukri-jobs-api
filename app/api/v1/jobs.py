@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -7,6 +8,7 @@ from app.services.collector import collection_service
 from app.services.naukri import NaukriUpstreamError
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/search", response_model=SearchResponse)
@@ -33,6 +35,12 @@ async def search_jobs(
     try:
         jobs, total, source = await collection_service.search(query)
     except NaukriUpstreamError as exc:
+        logger.warning(
+            "Naukri upstream unavailable: %s status=%s preview=%s",
+            exc,
+            exc.status_code,
+            exc.response_preview,
+        )
         detail = {"code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
         if exc.status_code is not None:
             detail["upstream_status"] = exc.status_code
@@ -40,8 +48,9 @@ async def search_jobs(
             detail["upstream_preview"] = exc.response_preview
         raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as exc:
-        # Browser/runtime failures are infrastructure failures, not client errors.
-        # Keep internal exception details out of the public API response.
+        # Keep exception details out of the public response, but log the full
+        # traceback server-side so Docker/Railway failures are diagnosable.
+        logger.exception("Collector failed for query=%s: %s", query, exc)
         raise HTTPException(
             status_code=503,
             detail={
