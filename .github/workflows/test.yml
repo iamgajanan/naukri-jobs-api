@@ -1,4 +1,4 @@
-name: test
+name: Test Naukri Jobs API
 
 on:
   push:
@@ -8,13 +8,91 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
-      - run: pip install -r requirements.txt
-      - run: playwright install --with-deps chromium
-      - run: python -m compileall app scripts
-      - run: pytest -q
+          cache: pip
+
+      - name: Install dependencies and Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Compile application
+        run: python -m compileall -q app
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Start API and wait for health
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/naukri-api.log 2>&1 &
+          echo $! > /tmp/naukri-api.pid
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/naukri-api.log
+          exit 1
+
+      - name: Verify health endpoint
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+          with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10) as response:
+              data = json.load(response)
+          assert data == {'status': 'ok'}, data
+          print('HEALTH_OK', data)
+          PY
+
+      - name: Live anonymous Naukri integration test
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          params = urllib.parse.urlencode({
+              'keyword': 'react',
+              'location': 'pune',
+              'page': 1,
+              'limit': 5,
+          })
+          url = 'http://127.0.0.1:8000/v1/jobs/search?' + params
+          print('Testing:', url)
+          try:
+              with urllib.request.urlopen(url, timeout=90) as response:
+                  source = response.headers.get('X-Data-Source')
+                  data = json.loads(response.read().decode('utf-8'))
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode('utf-8', errors='replace')
+              print('LIVE_HTTP_ERROR', exc.code, body)
+              raise
+
+          jobs = data.get('jobs') or []
+          assert data.get('status') == 'success', data
+          assert jobs, 'Live Naukri search returned zero jobs'
+          assert all(job.get('title') for job in jobs), jobs
+          assert all(job.get('job_url') for job in jobs), jobs
+          print('LIVE_NAUKRI_OK')
+          print('SOURCE:', source)
+          print('COUNT:', len(jobs))
+          for job in jobs[:5]:
+              print('-', job.get('title'), '|', job.get('company'), '|', job.get('location'))
+          PY
+
+      - name: Print API log on failure
+        if: failure()
+        run: cat /tmp/naukri-api.log || true
