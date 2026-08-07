@@ -6,9 +6,9 @@ from playwright.sync_api import sync_playwright
 class BrowserManager:
     """Playwright wrapper using an ephemeral anonymous browser context.
 
-    No Naukri credentials, cookies, storage state, or persistent browser profile
-    are loaded. Set NAUKRI_HEADLESS=false for the Xvfb-backed production-style
-    browser used by Docker/Railway.
+    The collector only needs the search-result DOM. Production therefore blocks
+    heavyweight assets and uses conservative Chromium flags to reduce Railway
+    memory/CPU pressure without changing the returned job data.
     """
 
     def __init__(self):
@@ -29,26 +29,50 @@ class BrowserManager:
             headless = self.configured_headless(default=True)
 
         self.playwright = sync_playwright().start()
-        launch_options = {"headless": headless}
+        launch_options = {
+            "headless": headless,
+            "args": [
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-sandbox",
+            ],
+        }
         executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
         if executable_path:
             launch_options["executable_path"] = executable_path
 
         self.browser = self.playwright.chromium.launch(**launch_options)
         self.context = self.browser.new_context(
-            viewport={"width": 1440, "height": 900},
+            viewport={"width": 1280, "height": 720},
             locale="en-US",
             timezone_id="Asia/Kolkata",
+            service_workers="block",
         )
+
+        # Search cards are text/DOM driven. Images, fonts and media add network,
+        # memory and decode cost but are not used by the parser.
+        self.context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in {"image", "media", "font"}
+            else route.continue_(),
+        )
+
         self.page = self.context.new_page()
-        self.page.set_default_timeout(10000)
-        self.page.set_default_navigation_timeout(30000)
+        self.page.set_default_timeout(8000)
+        self.page.set_default_navigation_timeout(20000)
         return self.page
 
     def close(self):
-        # Cleanup must never turn an otherwise successful collection into a
-        # public 503. Browser/context may already be closed by Chromium after a
-        # long multi-page scan, so every resource is best-effort independently.
+        if self.page:
+            try:
+                self.page.close()
+            except Exception:
+                pass
         if self.context:
             try:
                 self.context.close()
