@@ -1,9 +1,10 @@
 import re
+from typing import Optional
 
 from app.schemas.jobs import Experience, Salary
 
 
-def normalize_experience(value: str | None) -> Experience:
+def normalize_experience(value: Optional[str]) -> Experience:
     if not value:
         return Experience()
 
@@ -13,7 +14,7 @@ def normalize_experience(value: str | None) -> Experience:
     return Experience(text=value.strip(), min=minimum, max=maximum)
 
 
-def _to_rupees(number: float, unit: str | None) -> int:
+def _to_rupees(number: float, unit: Optional[str]) -> int:
     unit = (unit or "").lower()
     if "crore" in unit or unit in {"cr", "crores"}:
         return int(number * 10_000_000)
@@ -22,7 +23,7 @@ def _to_rupees(number: float, unit: str | None) -> int:
     return int(number)
 
 
-def normalize_salary(value: str | None) -> Salary:
+def normalize_salary(value: Optional[str]) -> Salary:
     if not value:
         return Salary()
 
@@ -41,7 +42,7 @@ def normalize_salary(value: str | None) -> Salary:
     return Salary(text=text, min=minimum, max=maximum, currency="INR")
 
 
-def normalize_work_mode(value: str | None) -> str | None:
+def normalize_work_mode(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     lowered = value.strip().lower()
