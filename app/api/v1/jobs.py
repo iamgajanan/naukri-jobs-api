@@ -39,6 +39,16 @@ async def search_jobs(
         if exc.response_preview:
             detail["upstream_preview"] = exc.response_preview
         raise HTTPException(status_code=503, detail=detail) from exc
+    except Exception as exc:
+        # Browser/runtime failures are infrastructure failures, not client errors.
+        # Keep internal exception details out of the public API response.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "COLLECTOR_UNAVAILABLE",
+                "message": "Job collection is temporarily unavailable",
+            },
+        ) from exc
 
     response.headers["X-Data-Source"] = source
 
