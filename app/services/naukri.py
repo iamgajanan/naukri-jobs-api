@@ -70,7 +70,9 @@ class NaukriService:
         jobs = []  # type: List[Job]
         seen = set()
         try:
-            page = browser.launch(headless=True)
+            # BrowserManager decides headless/headed from NAUKRI_HEADLESS.
+            # Production default remains headless; local diagnostics can set false.
+            page = browser.launch()
             keyword_slug = self._slugify(query.keyword)
             location_slug = self._slugify(query.location)
             if not keyword_slug:
@@ -89,9 +91,15 @@ class NaukriService:
                 url = base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
                 response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 if response is not None and response.status >= 400:
+                    preview = None
+                    try:
+                        preview = (page.locator("body").inner_text(timeout=1500) or "")[:500]
+                    except Exception:
+                        pass
                     raise NaukriUpstreamError(
                         "Naukri search page returned HTTP {}".format(response.status),
                         status_code=response.status,
+                        response_preview=preview,
                     )
                 page.wait_for_timeout(2500)
                 self._detect_challenge(page)
