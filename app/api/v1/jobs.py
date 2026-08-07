@@ -32,10 +32,15 @@ async def search_jobs(
     try:
         jobs, total = await service.search(query)
     except NaukriUpstreamError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "UPSTREAM_UNAVAILABLE", "message": str(exc)},
-        ) from exc
+        detail = {
+            "code": "UPSTREAM_UNAVAILABLE",
+            "message": str(exc),
+        }
+        if exc.status_code is not None:
+            detail["upstream_status"] = exc.status_code
+        if exc.response_preview:
+            detail["upstream_preview"] = exc.response_preview
+        raise HTTPException(status_code=503, detail=detail) from exc
 
     if work_mode:
         jobs = [job for job in jobs if job.work_mode == work_mode]
