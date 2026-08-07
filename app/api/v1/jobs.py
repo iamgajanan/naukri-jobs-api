@@ -1,16 +1,17 @@
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from app.schemas.jobs import SearchQuery, SearchResponse, WorkMode
-from app.services.naukri import NaukriService, NaukriUpstreamError
+from app.services.collector import collection_service
+from app.services.naukri import NaukriUpstreamError
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-service = NaukriService()
 
 
 @router.get("/search", response_model=SearchResponse)
 async def search_jobs(
+    response: Response,
     keyword: str = Query(..., min_length=1, max_length=100),
     location: Optional[str] = Query(None, max_length=100),
     experience: Optional[int] = Query(None, ge=0, le=50),
@@ -30,20 +31,16 @@ async def search_jobs(
     )
 
     try:
-        jobs, total = await service.search(query)
+        jobs, total, source = await collection_service.search(query)
     except NaukriUpstreamError as exc:
-        detail = {
-            "code": "UPSTREAM_UNAVAILABLE",
-            "message": str(exc),
-        }
+        detail = {"code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
         if exc.status_code is not None:
             detail["upstream_status"] = exc.status_code
         if exc.response_preview:
             detail["upstream_preview"] = exc.response_preview
         raise HTTPException(status_code=503, detail=detail) from exc
 
-    if work_mode:
-        jobs = [job for job in jobs if job.work_mode == work_mode]
+    response.headers["X-Data-Source"] = source
 
     return SearchResponse(
         query=query,
