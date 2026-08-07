@@ -24,7 +24,9 @@ class CollectionService:
         self._live_slots = threading.BoundedSemaphore(
             max(1, int(os.getenv("MAX_LIVE_COLLECTORS", "1")))
         )
-        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "2")))
+        # One fresh-browser retry is enough for transient blank pages while
+        # keeping a bad upstream request inside the public latency budget.
+        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "1")))
 
     def _lock_for(self, query: SearchQuery) -> threading.Lock:
         key = search_cache.key(query)
@@ -35,12 +37,6 @@ class CollectionService:
 
     @staticmethod
     def _retryable_upstream_error(exc: NaukriUpstreamError) -> bool:
-        """Only retry transient/blank upstream responses.
-
-        Authentication, CAPTCHA/challenge and explicit client-block responses are
-        intentionally not retried. A blank/empty Railway response is transient in
-        practice and benefits from a completely fresh browser/context.
-        """
         message = str(exc).lower()
         if "captcha" in message or "challenge" in message or "authentication" in message:
             return False
@@ -49,7 +45,6 @@ class CollectionService:
         return "no recognizable job cards" in message
 
     def _run_live_with_retry(self, query: SearchQuery):
-        """Retry transient browser and blank-upstream failures with fresh Chromium."""
         last_error = None
         for attempt in range(self.browser_retries + 1):
             try:
@@ -77,7 +72,7 @@ class CollectionService:
                 )
                 if attempt >= self.browser_retries:
                     raise
-            time.sleep(0.35 * (attempt + 1))
+            time.sleep(0.15 * (attempt + 1))
         raise last_error  # pragma: no cover
 
     def _collect_sync(self, query: SearchQuery) -> Tuple[List[Job], int, str]:
