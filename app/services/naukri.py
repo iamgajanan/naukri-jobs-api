@@ -6,11 +6,7 @@ from app.schemas.jobs import Job, SearchQuery
 from app.services.browser import BrowserManager
 from app.utils.normalizers import normalize_experience, normalize_salary, normalize_work_mode
 
-CARD_SELECTORS = [
-    "div.srp-jobtuple-wrapper",
-    "div.cust-job-tuple",
-    "article.jobTuple",
-]
+CARD_SELECTORS = ["div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.jobTuple"]
 TITLE_SELECTORS = ["a.title", ".title.ellipsis"]
 COMPANY_SELECTORS = ["a.comp-name", ".comp-name", ".subTitle"]
 LOCATION_SELECTORS = ["span.locWdth", ".loc-wrap span", ".location"]
@@ -28,11 +24,11 @@ class NaukriUpstreamError(Exception):
 
 
 class NaukriService:
-    """Browser-backed Naukri public-search scraper.
+    """Anonymous browser-backed collector for public Naukri search pages.
 
-    This intentionally does not solve or bypass CAPTCHA. If Naukri presents a
-    challenge/login page, the request fails explicitly instead of pretending
-    that zero jobs were found.
+    It does not load account credentials or saved cookies and does not attempt
+    to solve/bypass CAPTCHA. Challenges are reported to the collection layer so
+    cached/indexed data can be served instead.
     """
 
     MAX_PAGES = 6
@@ -60,18 +56,18 @@ class NaukriService:
     def _detect_challenge(page):
         url = (page.url or "").lower()
         if "/nlogin" in url or "/login" in url:
-            raise NaukriUpstreamError("Naukri requires login/session verification")
+            raise NaukriUpstreamError("Naukri requested authentication; anonymous collection unavailable")
         try:
             text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
         except Exception:
             text = ""
         markers = ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")
         if any(marker in text for marker in markers):
-            raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected")
+            raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected; collector will not bypass it")
 
     def _search_sync(self, query):
-        browser = BrowserManager(profile_name="browser-data-naukri")
-        jobs = []
+        browser = BrowserManager()
+        jobs = []  # type: List[Job]
         seen = set()
         try:
             page = browser.launch(headless=True)
@@ -80,11 +76,11 @@ class NaukriService:
             if not keyword_slug:
                 raise NaukriUpstreamError("keyword is required")
 
-            if location_slug:
-                base_path = "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
-            else:
-                base_path = "https://www.naukri.com/{}-jobs".format(keyword_slug)
-
+            base_path = (
+                "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
+                if location_slug
+                else "https://www.naukri.com/{}-jobs".format(keyword_slug)
+            )
             target = min(query.limit, 50)
             start_page = max(query.page, 1)
             last_page = min(start_page + self.MAX_PAGES - 1, start_page + ((target - 1) // 20))
@@ -107,7 +103,7 @@ class NaukriService:
                         cards = candidate
                         break
                 if cards is None or cards.count() == 0:
-                    break
+                    raise NaukriUpstreamError("Naukri returned no recognizable job cards; page structure may have changed")
 
                 page_new = 0
                 for index in range(cards.count()):
@@ -132,16 +128,9 @@ class NaukriService:
                     except Exception:
                         pass
                     if not link:
-                        try:
-                            anchors = card.locator("a")
-                            if anchors.count() > 0:
-                                link = anchors.first.get_attribute("href", timeout=1000) or ""
-                        except Exception:
-                            pass
+                        continue
                     if link.startswith("/"):
                         link = "https://www.naukri.com" + link
-                    if not link:
-                        continue
 
                     job_id = card.get_attribute("data-job-id") or ""
                     if not job_id:
@@ -157,16 +146,10 @@ class NaukriService:
                         continue
 
                     jobs.append(Job(
-                        id=str(job_id),
-                        title=title,
-                        company=company,
-                        location=location,
+                        id=str(job_id), title=title, company=company, location=location,
                         experience=normalize_experience(experience_text),
-                        salary=normalize_salary(salary_text),
-                        work_mode=work_mode,
-                        skills=[],
-                        description=description,
-                        posted_at=posted,
+                        salary=normalize_salary(salary_text), work_mode=work_mode,
+                        skills=[], description=description, posted_at=posted,
                         job_url=link,
                     ))
                     page_new += 1
@@ -174,6 +157,8 @@ class NaukriService:
                 if len(jobs) >= target or page_new == 0:
                     break
 
+            if not jobs:
+                raise NaukriUpstreamError("Naukri returned no usable jobs for this query")
             return jobs, len(jobs)
         finally:
             browser.close()
