@@ -110,15 +110,33 @@ class NaukriService:
 
     @staticmethod
     def _effective_keyword(query):
-        # Zero years means fresher/entry-level intent. A broad query such as
-        # "developer" otherwise scans mostly experienced jobs before our local
-        # experience filter can find matches. Narrow the public search first,
-        # then still validate every returned experience range below.
-        if query.experience == 0:
-            lowered = query.keyword.lower()
-            if "fresher" not in lowered and "entry level" not in lowered:
-                return "{} fresher".format(query.keyword)
-        return query.keyword
+        """Push selective filters upstream while retaining local validation.
+
+        Previously work_mode searched broad `developer jobs in pune` pages and only
+        filtered card text afterwards. With a four-page latency bound this could
+        legitimately inspect ~80 jobs yet return zero remote/hybrid/onsite jobs.
+        Adding the work-mode phrase to Naukri's public keyword search makes the
+        candidate pool relevant before local validation; local validation remains
+        authoritative so unrelated keyword matches are never returned.
+        """
+        keyword = query.keyword.strip()
+        lowered = keyword.lower()
+
+        if query.experience == 0 and "fresher" not in lowered and "entry level" not in lowered:
+            keyword = "{} fresher".format(keyword)
+            lowered = keyword.lower()
+
+        mode_terms = {
+            "remote": ("remote", ("remote", "work from home", "wfh")),
+            "hybrid": ("hybrid", ("hybrid",)),
+            "onsite": ("work from office", ("onsite", "on-site", "work from office", "wfo")),
+        }
+        if query.work_mode in mode_terms:
+            search_term, aliases = mode_terms[query.work_mode]
+            if not any(alias in lowered for alias in aliases):
+                keyword = "{} {}".format(keyword, search_term)
+
+        return keyword
 
     def _search_sync(self, query):
         browser = BrowserManager(); jobs = []; seen = set()
@@ -131,9 +149,6 @@ class NaukriService:
             target = max(1, min(query.limit, self.MAX_LIMIT)); start_page = max(query.page, 1)
             minimum_pages = max(1, (target + self.NAUKRI_PAGE_SIZE - 1) // self.NAUKRI_PAGE_SIZE)
             filtered = query.experience is not None or query.freshness is not None or query.work_mode is not None
-            # Previously every filtered request scanned 10 pages (~200 cards),
-            # producing 20-23s latency for rare work modes. Bound small filtered
-            # searches to four pages; large limits still get the pages they need.
             pages_to_scan = min(max(minimum_pages, self.FILTER_SCAN_PAGES if filtered else minimum_pages), self.MAX_PAGES)
 
             for page_num in range(start_page, start_page + pages_to_scan):
