@@ -1,69 +1,85 @@
 # Naukri Jobs API
 
-A lightweight FastAPI service for searching and normalizing public Naukri job listings.
+Independent FastAPI service for searching and normalizing public Naukri job listings.
 
-> This project is an independent API project and is not an official Naukri.com API.
+> This is not an official Naukri.com API and is not affiliated with Naukri.
 
-## v1 stack
+## v1 architecture
 
-- FastAPI
-- HTTPX
-- Pydantic
-- Docker
-- Pytest
+- FastAPI + Pydantic
+- Playwright collector
+- Redis shared TTL cache in production, automatic in-memory fallback for development
+- Per-query request coalescing inside each API process
+- Pytest + GitHub Actions
+- Docker / Docker Compose
+- No PostgreSQL or Celery
+- No Naukri login, credentials, saved cookies, or persistent browser profile
 
-No PostgreSQL, Redis, Celery, browser profile, or Naukri login is required by the current architecture.
-
-## Run locally
+## Local setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium
 uvicorn app.main:app --reload
 ```
 
-Open Swagger at `http://127.0.0.1:8000/docs`.
+Swagger: `http://127.0.0.1:8000/docs`
 
-## Health
+For the local headed diagnostic/verification mode that has been proven to work on macOS:
 
 ```bash
-curl http://127.0.0.1:8000/health
+export NAUKRI_HEADLESS=false
+uvicorn app.main:app --reload
 ```
 
 ## Search
 
 ```bash
-curl "http://127.0.0.1:8000/v1/jobs/search?keyword=react&location=pune&experience=5&freshness=7&limit=20"
+curl "http://127.0.0.1:8000/v1/jobs/search?keyword=react&location=pune&experience=5&freshness=7&page=1&limit=20"
 ```
 
-Supported query parameters:
+Parameters: `keyword` (required), `location`, `experience`, `freshness` (1-30 days), `work_mode` (`remote`, `hybrid`, `onsite`), `page` (>=1), and `limit` (1-50).
 
-- `keyword` - required
-- `location`
-- `experience` - years
-- `freshness` - maximum job age in days
-- `work_mode` - `remote`, `hybrid`, or `onsite`
-- `page` - defaults to 1
-- `limit` - 1 to 50, defaults to 20
+Responses include `X-Data-Source: live`, `cache`, or `stale-cache`.
+
+## Cache
+
+Set `REDIS_URL` to use Redis. Without it the service falls back to process-local memory. Defaults are 10 minutes for fresh cache and 1 hour for local stale fallback.
+
+```bash
+REDIS_URL=redis://localhost:6379/0
+CACHE_TTL_SECONDS=600
+CACHE_STALE_SECONDS=3600
+```
+
+`GET /health` reports `cache: redis` or `cache: memory`.
 
 ## Tests
 
-```bash
-pytest
-```
-
-## Docker
+Deterministic tests do not contact Naukri:
 
 ```bash
-docker build -t naukri-jobs-api .
-docker run --rm -p 8000:8000 naukri-jobs-api
+pytest -q
 ```
 
-## API response
+Live verification is deliberately separate because upstream behavior depends on the browser environment:
 
-The public response is normalized so API consumers do not have to understand upstream field names. Salary values are normalized to INR amounts when possible, experience is represented as min/max years, duplicate IDs are removed, and upstream failures return HTTP 503 rather than exposing internal exceptions.
+```bash
+NAUKRI_HEADLESS=false python scripts/live_verify.py
+```
 
-## Next milestone
+The script checks multiple queries, pagination, limits, filters, normalized work mode, duplicate IDs, required job fields, and repeated-request caching.
 
-Validate the upstream search integration against multiple real queries and harden field mapping, retry behavior, rate limiting, caching, and deployment before commercial release.
+## Docker Compose
+
+```bash
+docker compose up --build
+```
+
+This starts the API and Redis. Note: production deployment is not considered verified until the browser execution mode is proven in the target server environment; anonymous headless collection has previously received HTTP 403 while local headed Chromium succeeded.
+
+## Production status
+
+Application structure, validation, normalization, caching, CI, Docker configuration, and live verification tooling are implemented. Remaining release gates are environment-specific live browser verification, final data-quality verification against real results, production deployment verification, and RapidAPI marketplace wiring/load checks.
