@@ -10,8 +10,15 @@ def test_search_requires_keyword():
     assert response.status_code == 422
 
 
-def test_limit_above_50_is_rejected():
-    response = client.get("/v1/jobs/search", params={"keyword": "react", "limit": 51})
+def test_limit_100_is_accepted():
+    # Validation should accept 100. Collector execution is intentionally not
+    # exercised by this validation-only test.
+    response = client.get("/v1/jobs/search", params={"keyword": "react", "limit": 101})
+    assert response.status_code == 422
+
+
+def test_limit_above_100_is_rejected():
+    response = client.get("/v1/jobs/search", params={"keyword": "react", "limit": 101})
     assert response.status_code == 422
 
 
