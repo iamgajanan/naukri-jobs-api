@@ -20,7 +20,7 @@ async def search_jobs(
     freshness: Optional[int] = Query(None, ge=1, le=30),
     work_mode: Optional[WorkMode] = None,
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(20, ge=1, le=100),
 ) -> SearchResponse:
     query = SearchQuery(
         keyword=keyword.strip(),
@@ -48,8 +48,6 @@ async def search_jobs(
             detail["upstream_preview"] = exc.response_preview
         raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as exc:
-        # Keep exception details out of the public response, but log the full
-        # traceback server-side so Docker/Railway failures are diagnosable.
         logger.exception("Collector failed for query=%s: %s", query, exc)
         raise HTTPException(
             status_code=503,
