@@ -11,8 +11,8 @@ class CollectionService:
     """Coordinates cached results and the Naukri collection worker.
 
     Fresh cache is returned immediately. On a miss, one collection is allowed
-    per query key. If collection fails, recently indexed stale results are
-    returned when available instead of taking the whole API down.
+    per query key. If collection fails for any reason, recently indexed stale
+    results are returned when available instead of taking the whole API down.
     """
 
     def __init__(self) -> None:
@@ -44,7 +44,11 @@ class CollectionService:
                 jobs, total = self.naukri._search_sync(query)
                 search_cache.set(query, (jobs, total))
                 return jobs, total, "live"
-            except NaukriUpstreamError:
+            except Exception:
+                # Browser/Playwright cleanup and transient collector failures are
+                # just as recoverable as explicit upstream errors. Prefer a
+                # recently indexed response when one exists, then re-raise the
+                # original exception for correct diagnostics if it does not.
                 stale = search_cache.get(query, allow_stale=True)
                 if stale is not None:
                     jobs, total = stale
