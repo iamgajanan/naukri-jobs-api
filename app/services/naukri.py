@@ -9,8 +9,14 @@ from app.utils.normalizers import (
     normalize_experience, normalize_salary, normalize_work_mode,
 )
 
-CARD_SELECTORS = ["div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.jobTuple"]
-TITLE_SELECTORS = ["a.title", ".title.ellipsis"]
+CARD_SELECTORS = [
+    "div.srp-jobtuple-wrapper",
+    "div.cust-job-tuple",
+    "article.jobTuple",
+    "div.jobTuple",
+    "div[data-job-id]",
+]
+TITLE_SELECTORS = ["a.title", "a[title][href*='job-listings']", "a[href*='job-listings']", ".title.ellipsis"]
 COMPANY_SELECTORS = ["a.comp-name", ".comp-name", ".subTitle"]
 LOCATION_SELECTORS = ["span.locWdth", ".loc-wrap span", ".location"]
 EXPERIENCE_SELECTORS = ["span.expwdth", ".exp-wrap span", ".experience"]
@@ -70,20 +76,65 @@ class NaukriService:
         return values
 
     @staticmethod
+    def _page_snapshot(page):
+        """Return small diagnostics only; never stores cookies/profile/session data."""
+        try:
+            title = page.title() or ""
+        except Exception:
+            title = ""
+        try:
+            body = " ".join((page.locator("body").inner_text(timeout=2000) or "").split())[:1200]
+        except Exception:
+            body = ""
+        try:
+            links = page.locator("a[href*='job-listings']").count()
+        except Exception:
+            links = -1
+        return "url={} | title={} | job_links={} | body={}".format(page.url, title, links, body)
+
+    @staticmethod
     def _detect_challenge(page):
         url = (page.url or "").lower()
         if "/nlogin" in url or "/login" in url:
-            raise NaukriUpstreamError("Naukri requested authentication; anonymous collection unavailable")
+            raise NaukriUpstreamError(
+                "Naukri requested authentication; anonymous collection unavailable",
+                response_preview=NaukriService._page_snapshot(page),
+            )
         try:
             text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
         except Exception:
             text = ""
         if any(marker in text for marker in ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")):
-            raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected; collector will not bypass it")
+            raise NaukriUpstreamError(
+                "Naukri CAPTCHA/challenge detected; collector will not bypass it",
+                response_preview=NaukriService._page_snapshot(page),
+            )
 
     @staticmethod
     def _page_url(base_path, page_num):
         return base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
+
+    @staticmethod
+    def _find_cards(page):
+        for selector in CARD_SELECTORS:
+            try:
+                candidate = page.locator(selector)
+                if candidate.count() > 0:
+                    return candidate
+            except Exception:
+                continue
+
+        # Layout-independent fallback: find real job-detail links and use their
+        # nearest useful container. This is selector resilience, not a bypass.
+        try:
+            links = page.locator("a[href*='job-listings']")
+            if links.count() > 0:
+                containers = links.locator("xpath=ancestor::*[@data-job-id or self::article or contains(@class,'jobTuple')][1]")
+                if containers.count() > 0:
+                    return containers
+        except Exception:
+            pass
+        return None
 
     def _search_sync(self, query):
         browser = BrowserManager()
@@ -107,30 +158,34 @@ class NaukriService:
             pages_to_scan = self.MAX_PAGES if filtered else min(minimum_pages, self.MAX_PAGES)
 
             for page_num in range(start_page, start_page + pages_to_scan):
-                response = page.goto(self._page_url(base_path, page_num), wait_until="domcontentloaded", timeout=30000)
+                url = self._page_url(base_path, page_num)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 if response is not None and response.status >= 400:
-                    preview = None
-                    try:
-                        preview = (page.locator("body").inner_text(timeout=1500) or "")[:500]
-                    except Exception:
-                        pass
                     raise NaukriUpstreamError(
                         "Naukri search page returned HTTP {}".format(response.status),
-                        status_code=response.status, response_preview=preview,
+                        status_code=response.status,
+                        response_preview=self._page_snapshot(page),
                     )
-                page.wait_for_timeout(2500)
-                self._detect_challenge(page)
 
-                cards = None
-                for selector in CARD_SELECTORS:
-                    candidate = page.locator(selector)
-                    if candidate.count() > 0:
-                        cards = candidate
-                        break
+                # Give the client-rendered job list a chance to appear, without
+                # making any assumption that a particular selector is present.
+                try:
+                    page.wait_for_function(
+                        "() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0",
+                        timeout=6000,
+                    )
+                except Exception:
+                    page.wait_for_timeout(1000)
+
+                self._detect_challenge(page)
+                cards = self._find_cards(page)
                 if cards is None or cards.count() == 0:
                     if jobs:
                         break
-                    raise NaukriUpstreamError("Naukri returned no recognizable job cards; page structure may have changed")
+                    raise NaukriUpstreamError(
+                        "Naukri returned no recognizable job cards",
+                        response_preview=self._page_snapshot(page),
+                    )
 
                 for index in range(cards.count()):
                     if len(jobs) >= target:
@@ -151,7 +206,7 @@ class NaukriService:
 
                     link = ""
                     try:
-                        title_link = card.locator("a.title")
+                        title_link = card.locator("a[href*='job-listings']")
                         if title_link.count() > 0:
                             link = title_link.first.get_attribute("href", timeout=1000) or ""
                     except Exception:
