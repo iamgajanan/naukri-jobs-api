@@ -1,15 +1,21 @@
-"""Pre-Railway live verification and timing benchmark.
+"""Live verification and timing benchmark.
 
 Covers every meaningful filter PRESENCE combination supported by the API.
 Also checks validation, data quality, latency budgets and Redis cache behavior.
+
+Set API_BASE_URL to test a deployed environment, for example:
+API_BASE_URL=https://naukri-jobs-api-production.up.railway.app python scripts/live_verify.py
 """
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "http://127.0.0.1:8000/v1/jobs/search"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+BASE = API_BASE_URL + "/v1/jobs/search"
+print("Testing API:", API_BASE_URL)
 
 CASES = [
     ("baseline", {"keyword": "developer", "location": "pune", "page": 1, "limit": 20}),
@@ -36,16 +42,11 @@ CASES = [
     ("fresh-30", {"keyword": "developer", "location": "pune", "freshness": 30, "page": 1, "limit": 5}),
 ]
 
-# Production guardrails. These are deliberately generous enough for normal
-# network variance while still catching a return to 20+ second filtered calls.
 def latency_budget(name):
-    if name == "limit-100":
-        return 20.0
-    if name == "limit-50":
-        return 15.0
-    if "mode" in name:
-        return 15.0
-    return 12.0
+    if name == "limit-100": return 25.0
+    if name == "limit-50": return 20.0
+    if "mode" in name: return 20.0
+    return 15.0
 
 
 def request(params):
@@ -132,20 +133,18 @@ for name, params in INVALID:
     else:
         failures.append((name, detail)); print("FAIL {:20s} {}".format(name, detail))
 
-# Cache verification must use a REAL upstream query. The old synthetic keyword
-# 'react cache benchmark' had no Naukri results, so a 503 there tested an
-# impossible search rather than Redis. We use a real query and a distinct page
-# to avoid colliding with the normal cases above.
 cache_case = {"keyword": "react", "location": "pune", "page": 4, "limit": 5}
 try:
-    source1, payload1, live_time = request(cache_case)
+    source1, payload1, first_time = request(cache_case)
     validate(cache_case, payload1)
     source2, payload2, cache_time = request(cache_case)
     validate(cache_case, payload2)
     assert source2 == "cache", "expected repeated request to use cache, got {!r}".format(source2)
     assert payload1["jobs"] == payload2["jobs"], "cached payload differs"
-    assert cache_time < 1.0, "cache response too slow: {:.3f}s".format(cache_time)
-    print("PASS cache-repeat         first={} second={} first={:.3f}s cache={:.3f}s".format(source1, source2, live_time, cache_time))
+    # Remote Railway requests include public-network latency, so use a modest
+    # end-to-end budget while still ensuring caching is materially fast.
+    assert cache_time < 2.0, "cache response too slow: {:.3f}s".format(cache_time)
+    print("PASS cache-repeat         first={} second={} first={:.3f}s cache={:.3f}s".format(source1, source2, first_time, cache_time))
 except Exception as exc:
     failures.append(("cache-repeat", str(exc))); print("FAIL cache-repeat         {}".format(exc))
 
