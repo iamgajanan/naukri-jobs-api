@@ -24,7 +24,7 @@ class CollectionService:
         self._live_slots = threading.BoundedSemaphore(
             max(1, int(os.getenv("MAX_LIVE_COLLECTORS", "1")))
         )
-        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "1")))
+        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "2")))
 
     def _lock_for(self, query: SearchQuery) -> threading.Lock:
         key = search_cache.key(query)
@@ -33,20 +33,39 @@ class CollectionService:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
 
-    def _run_live_with_retry(self, query: SearchQuery):
-        """Retry only transient browser/runtime failures.
+    @staticmethod
+    def _retryable_upstream_error(exc: NaukriUpstreamError) -> bool:
+        """Only retry transient/blank upstream responses.
 
-        Each NaukriService search creates and closes its own BrowserManager, so a
-        retry gets a completely fresh Playwright process/context. We deliberately
-        do not retry application/programming errors indefinitely.
+        Authentication, CAPTCHA/challenge and explicit client-block responses are
+        intentionally not retried. A blank/empty Railway response is transient in
+        practice and benefits from a completely fresh browser/context.
         """
+        message = str(exc).lower()
+        if "captcha" in message or "challenge" in message or "authentication" in message:
+            return False
+        if exc.status_code is not None:
+            return exc.status_code >= 500 or exc.status_code in {408, 429}
+        return "no recognizable job cards" in message
+
+    def _run_live_with_retry(self, query: SearchQuery):
+        """Retry transient browser and blank-upstream failures with fresh Chromium."""
         last_error = None
         for attempt in range(self.browser_retries + 1):
             try:
                 return self.naukri._search_sync(query)
-            except NaukriUpstreamError:
-                # NaukriService already performs its own bounded empty-page retry.
-                raise
+            except NaukriUpstreamError as exc:
+                last_error = exc
+                if not self._retryable_upstream_error(exc) or attempt >= self.browser_retries:
+                    raise
+                logger.warning(
+                    "Transient Naukri upstream failure attempt=%s/%s query=%s: %s preview=%s",
+                    attempt + 1,
+                    self.browser_retries + 1,
+                    query,
+                    exc,
+                    exc.response_preview,
+                )
             except PlaywrightError as exc:
                 last_error = exc
                 logger.warning(
@@ -58,7 +77,7 @@ class CollectionService:
                 )
                 if attempt >= self.browser_retries:
                     raise
-                time.sleep(0.2)
+            time.sleep(0.35 * (attempt + 1))
         raise last_error  # pragma: no cover
 
     def _collect_sync(self, query: SearchQuery) -> Tuple[List[Job], int, str]:
