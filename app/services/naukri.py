@@ -9,13 +9,7 @@ from app.utils.normalizers import (
     normalize_experience, normalize_salary, normalize_work_mode,
 )
 
-CARD_SELECTORS = [
-    "div.srp-jobtuple-wrapper",
-    "div.cust-job-tuple",
-    "article.jobTuple",
-    "div.jobTuple",
-    "div[data-job-id]",
-]
+CARD_SELECTORS = ["div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.jobTuple", "div.jobTuple", "div[data-job-id]"]
 TITLE_SELECTORS = ["a.title", "a[title][href*='job-listings']", "a[href*='job-listings']", ".title.ellipsis"]
 COMPANY_SELECTORS = ["a.comp-name", ".comp-name", ".subTitle"]
 LOCATION_SELECTORS = ["span.locWdth", ".loc-wrap span", ".location"]
@@ -35,6 +29,7 @@ class NaukriUpstreamError(Exception):
 
 class NaukriService:
     MAX_PAGES = 10
+    FILTER_SCAN_PAGES = 4
     NAUKRI_PAGE_SIZE = 20
     MAX_LIMIT = 100
 
@@ -67,8 +62,7 @@ class NaukriService:
                     text = (locator.nth(index).text_content(timeout=500) or "").strip()
                     key = text.lower()
                     if text and key not in seen:
-                        seen.add(key)
-                        values.append(text)
+                        seen.add(key); values.append(text)
                 if values:
                     break
             except Exception:
@@ -77,37 +71,23 @@ class NaukriService:
 
     @staticmethod
     def _page_snapshot(page):
-        try:
-            title = page.title() or ""
-        except Exception:
-            title = ""
-        try:
-            body = " ".join((page.locator("body").inner_text(timeout=2000) or "").split())[:1200]
-        except Exception:
-            body = ""
-        try:
-            links = page.locator("a[href*='job-listings']").count()
-        except Exception:
-            links = -1
+        try: title = page.title() or ""
+        except Exception: title = ""
+        try: body = " ".join((page.locator("body").inner_text(timeout=2000) or "").split())[:1200]
+        except Exception: body = ""
+        try: links = page.locator("a[href*='job-listings']").count()
+        except Exception: links = -1
         return "url={} | title={} | job_links={} | body={}".format(page.url, title, links, body)
 
     @staticmethod
     def _detect_challenge(page):
         url = (page.url or "").lower()
         if "/nlogin" in url or "/login" in url:
-            raise NaukriUpstreamError(
-                "Naukri requested authentication; anonymous collection unavailable",
-                response_preview=NaukriService._page_snapshot(page),
-            )
-        try:
-            text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
-        except Exception:
-            text = ""
+            raise NaukriUpstreamError("Naukri requested authentication; anonymous collection unavailable", response_preview=NaukriService._page_snapshot(page))
+        try: text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
+        except Exception: text = ""
         if any(marker in text for marker in ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")):
-            raise NaukriUpstreamError(
-                "Naukri CAPTCHA/challenge detected; collector will not bypass it",
-                response_preview=NaukriService._page_snapshot(page),
-            )
+            raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected; collector will not bypass it", response_preview=NaukriService._page_snapshot(page))
 
     @staticmethod
     def _page_url(base_path, page_num):
@@ -118,75 +98,60 @@ class NaukriService:
         for selector in CARD_SELECTORS:
             try:
                 candidate = page.locator(selector)
-                if candidate.count() > 0:
-                    return candidate
-            except Exception:
-                continue
+                if candidate.count() > 0: return candidate
+            except Exception: continue
         try:
             links = page.locator("a[href*='job-listings']")
             if links.count() > 0:
                 containers = links.locator("xpath=ancestor::*[@data-job-id or self::article or contains(@class,'jobTuple')][1]")
-                if containers.count() > 0:
-                    return containers
-        except Exception:
-            pass
+                if containers.count() > 0: return containers
+        except Exception: pass
         return None
 
+    @staticmethod
+    def _effective_keyword(query):
+        # Zero years means fresher/entry-level intent. A broad query such as
+        # "developer" otherwise scans mostly experienced jobs before our local
+        # experience filter can find matches. Narrow the public search first,
+        # then still validate every returned experience range below.
+        if query.experience == 0:
+            lowered = query.keyword.lower()
+            if "fresher" not in lowered and "entry level" not in lowered:
+                return "{} fresher".format(query.keyword)
+        return query.keyword
+
     def _search_sync(self, query):
-        browser = BrowserManager()
-        jobs = []  # type: List[Job]
-        seen = set()
+        browser = BrowserManager(); jobs = []; seen = set()
         try:
             page = browser.launch()
-            keyword_slug = self._slugify(query.keyword)
+            keyword_slug = self._slugify(self._effective_keyword(query))
             location_slug = self._slugify(query.location)
-            if not keyword_slug:
-                raise NaukriUpstreamError("keyword is required")
-
-            base_path = (
-                "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
-                if location_slug else "https://www.naukri.com/{}-jobs".format(keyword_slug)
-            )
-            target = max(1, min(query.limit, self.MAX_LIMIT))
-            start_page = max(query.page, 1)
+            if not keyword_slug: raise NaukriUpstreamError("keyword is required")
+            base_path = "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug) if location_slug else "https://www.naukri.com/{}-jobs".format(keyword_slug)
+            target = max(1, min(query.limit, self.MAX_LIMIT)); start_page = max(query.page, 1)
             minimum_pages = max(1, (target + self.NAUKRI_PAGE_SIZE - 1) // self.NAUKRI_PAGE_SIZE)
             filtered = query.experience is not None or query.freshness is not None or query.work_mode is not None
-            pages_to_scan = self.MAX_PAGES if filtered else min(minimum_pages, self.MAX_PAGES)
+            # Previously every filtered request scanned 10 pages (~200 cards),
+            # producing 20-23s latency for rare work modes. Bound small filtered
+            # searches to four pages; large limits still get the pages they need.
+            pages_to_scan = min(max(minimum_pages, self.FILTER_SCAN_PAGES if filtered else minimum_pages), self.MAX_PAGES)
 
             for page_num in range(start_page, start_page + pages_to_scan):
-                url = self._page_url(base_path, page_num)
-                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                response = page.goto(self._page_url(base_path, page_num), wait_until="domcontentloaded", timeout=30000)
                 if response is not None and response.status >= 400:
-                    raise NaukriUpstreamError(
-                        "Naukri search page returned HTTP {}".format(response.status),
-                        status_code=response.status,
-                        response_preview=self._page_snapshot(page),
-                    )
-                try:
-                    page.wait_for_function(
-                        "() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0",
-                        timeout=6000,
-                    )
-                except Exception:
-                    page.wait_for_timeout(1000)
-
+                    raise NaukriUpstreamError("Naukri search page returned HTTP {}".format(response.status), status_code=response.status, response_preview=self._page_snapshot(page))
+                try: page.wait_for_function("() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0", timeout=6000)
+                except Exception: page.wait_for_timeout(1000)
                 self._detect_challenge(page)
                 cards = self._find_cards(page)
                 if cards is None or cards.count() == 0:
-                    if jobs:
-                        break
-                    raise NaukriUpstreamError(
-                        "Naukri returned no recognizable job cards",
-                        response_preview=self._page_snapshot(page),
-                    )
+                    if jobs: break
+                    raise NaukriUpstreamError("Naukri returned no recognizable job cards", response_preview=self._page_snapshot(page))
 
                 for index in range(cards.count()):
-                    if len(jobs) >= target:
-                        break
-                    card = cards.nth(index)
-                    title = self._first_match(card, TITLE_SELECTORS)
-                    if not title:
-                        continue
+                    if len(jobs) >= target: break
+                    card = cards.nth(index); title = self._first_match(card, TITLE_SELECTORS)
+                    if not title: continue
                     company = self._first_match(card, COMPANY_SELECTORS)
                     location = self._first_match(card, LOCATION_SELECTORS) or query.location
                     experience_text = self._first_match(card, EXPERIENCE_SELECTORS)
@@ -194,48 +159,28 @@ class NaukriService:
                     posted = self._first_match(card, POSTED_SELECTORS)
                     description = self._first_match(card, DESCRIPTION_SELECTORS)
                     experience = normalize_experience(experience_text)
-                    if not experience_matches(experience, query.experience) or not freshness_matches(posted, query.freshness):
-                        continue
-
+                    if not experience_matches(experience, query.experience) or not freshness_matches(posted, query.freshness): continue
                     link = ""
                     try:
                         title_link = card.locator("a[href*='job-listings']")
-                        if title_link.count() > 0:
-                            link = title_link.first.get_attribute("href", timeout=1000) or ""
-                    except Exception:
-                        pass
-                    if not link:
-                        continue
-                    if link.startswith("/"):
-                        link = "https://www.naukri.com" + link
-
+                        if title_link.count() > 0: link = title_link.first.get_attribute("href", timeout=1000) or ""
+                    except Exception: pass
+                    if not link: continue
+                    if link.startswith("/"): link = "https://www.naukri.com" + link
                     job_id = card.get_attribute("data-job-id") or ""
                     if not job_id:
-                        match = re.search(r"-(\d{6,})(?:\?|$)", link)
-                        job_id = match.group(1) if match else link
+                        match = re.search(r"-(\d{6,})(?:\?|$)", link); job_id = match.group(1) if match else link
                     dedupe_key = str(job_id or link).strip().lower()
-                    if dedupe_key in seen:
-                        continue
-
-                    text_blob = card.text_content() or ""
-                    work_mode = normalize_work_mode(text_blob)
-                    if query.work_mode and work_mode != query.work_mode:
-                        continue
-
+                    if dedupe_key in seen: continue
+                    text_blob = card.text_content() or ""; work_mode = normalize_work_mode(text_blob)
+                    if query.work_mode and work_mode != query.work_mode: continue
                     seen.add(dedupe_key)
-                    jobs.append(Job(
-                        id=str(job_id), title=title, company=company, location=location,
-                        experience=experience, salary=normalize_salary(salary_text), work_mode=work_mode,
-                        employment_type=normalize_employment_type(text_blob),
-                        skills=self._all_text(card, SKILL_SELECTORS), description=description,
-                        posted_at=posted, job_url=link,
-                    ))
-                if len(jobs) >= target:
-                    break
-
+                    jobs.append(Job(id=str(job_id), title=title, company=company, location=location, experience=experience,
+                        salary=normalize_salary(salary_text), work_mode=work_mode, employment_type=normalize_employment_type(text_blob),
+                        skills=self._all_text(card, SKILL_SELECTORS), description=description, posted_at=posted, job_url=link))
+                if len(jobs) >= target: break
             return jobs[:target], min(len(jobs), target)
-        finally:
-            browser.close()
+        finally: browser.close()
 
     async def search(self, query: SearchQuery) -> Tuple[List[Job], int]:
         return await asyncio.to_thread(self._search_sync, query)
