@@ -1,11 +1,14 @@
+import os
+
 from playwright.sync_api import sync_playwright
 
 
 class BrowserManager:
     """Playwright wrapper using an ephemeral anonymous browser context.
 
-    No Naukri credentials, cookies, or persistent browser profile are loaded.
-    Each collector run starts with a fresh browser context.
+    No Naukri credentials, cookies, storage state, or persistent browser profile
+    are loaded. Set NAUKRI_HEADLESS=false only for local diagnostic runs where
+    you want to visibly inspect the page Naukri returns.
     """
 
     def __init__(self):
@@ -14,9 +17,25 @@ class BrowserManager:
         self.context = None
         self.page = None
 
-    def launch(self, headless=True):
+    @staticmethod
+    def configured_headless(default=True):
+        value = os.getenv("NAUKRI_HEADLESS")
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    def launch(self, headless=None):
+        if headless is None:
+            headless = self.configured_headless(default=True)
+
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=headless)
+
+        launch_options = {"headless": headless}
+        executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+        if executable_path:
+            launch_options["executable_path"] = executable_path
+
+        self.browser = self.playwright.chromium.launch(**launch_options)
         self.context = self.browser.new_context(
             viewport={"width": 1440, "height": 900},
             locale="en-US",
