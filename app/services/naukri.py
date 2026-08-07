@@ -8,7 +8,10 @@ from app.utils.normalizers import normalize_experience, normalize_salary, normal
 
 
 class NaukriUpstreamError(Exception):
-    pass
+    def __init__(self, message: str, status_code=None, response_preview=None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_preview = response_preview
 
 
 class NaukriService:
@@ -26,8 +29,9 @@ class NaukriService:
             "accept-language": "en-US,en;q=0.9",
             "appid": "109",
             "clientid": "d3skt0p",
+            "content-type": "application/json",
             "referer": referer,
-            "systemid": "Naukri",
+            "systemid": "109",
             "user-agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -38,10 +42,11 @@ class NaukriService:
     def _params(self, query: SearchQuery) -> Dict[str, Union[str, int]]:
         params = {
             "noOfResults": query.limit,
-            "urlType": "search_by_keyword",
+            "urlType": "search_by_key_loc" if query.location else "search_by_keyword",
             "searchType": "adv",
             "keyword": query.keyword,
             "pageNo": query.page,
+            "src": "directSearch",
         }
         if query.location:
             params["location"] = query.location
@@ -59,10 +64,26 @@ class NaukriService:
                     params=self._params(query),
                     headers=self._headers(query),
                 )
-                response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise NaukriUpstreamError("Naukri search is temporarily unavailable") from exc
+        except httpx.HTTPError as exc:
+            raise NaukriUpstreamError("Could not connect to Naukri: {}".format(type(exc).__name__)) from exc
+
+        if response.status_code >= 400:
+            preview = response.text[:300].replace("\n", " ")
+            raise NaukriUpstreamError(
+                "Naukri returned HTTP {}".format(response.status_code),
+                status_code=response.status_code,
+                response_preview=preview,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            preview = response.text[:300].replace("\n", " ")
+            raise NaukriUpstreamError(
+                "Naukri returned a non-JSON response",
+                status_code=response.status_code,
+                response_preview=preview,
+            ) from exc
 
         raw_jobs = payload.get("jobDetails") or payload.get("jobs") or []
         jobs = []  # type: List[Job]
