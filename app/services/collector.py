@@ -2,20 +2,23 @@ import asyncio
 import logging
 import os
 import threading
-import time
 from typing import List, Tuple
-
-from playwright.sync_api import Error as PlaywrightError
 
 from app.schemas.jobs import Job, SearchQuery
 from app.services.cache import search_cache
-from app.services.naukri import NaukriService, NaukriUpstreamError
+from app.services.naukri import NaukriService
 
 logger = logging.getLogger(__name__)
 
 
 class CollectionService:
-    """Coordinates cache, single-flight requests and bounded browser work."""
+    """Coordinates cache, single-flight requests and bounded browser work.
+
+    Naukri starts throttling when a verification suite opens many anonymous
+    Chromium sessions back-to-back. Keep one live collector at a time, avoid
+    retry storms, and serve a recent successful result when the upstream has a
+    transient failure.
+    """
 
     def __init__(self) -> None:
         self.naukri = NaukriService()
@@ -24,9 +27,6 @@ class CollectionService:
         self._live_slots = threading.BoundedSemaphore(
             max(1, int(os.getenv("MAX_LIVE_COLLECTORS", "1")))
         )
-        # One fresh-browser retry is enough for transient blank pages while
-        # keeping a bad upstream request inside the public latency budget.
-        self.browser_retries = max(0, int(os.getenv("COLLECTOR_BROWSER_RETRIES", "1")))
 
     def _lock_for(self, query: SearchQuery) -> threading.Lock:
         key = search_cache.key(query)
@@ -34,46 +34,6 @@ class CollectionService:
             if key not in self._locks:
                 self._locks[key] = threading.Lock()
             return self._locks[key]
-
-    @staticmethod
-    def _retryable_upstream_error(exc: NaukriUpstreamError) -> bool:
-        message = str(exc).lower()
-        if "captcha" in message or "challenge" in message or "authentication" in message:
-            return False
-        if exc.status_code is not None:
-            return exc.status_code >= 500 or exc.status_code in {408, 429}
-        return "no recognizable job cards" in message
-
-    def _run_live_with_retry(self, query: SearchQuery):
-        last_error = None
-        for attempt in range(self.browser_retries + 1):
-            try:
-                return self.naukri._search_sync(query)
-            except NaukriUpstreamError as exc:
-                last_error = exc
-                if not self._retryable_upstream_error(exc) or attempt >= self.browser_retries:
-                    raise
-                logger.warning(
-                    "Transient Naukri upstream failure attempt=%s/%s query=%s: %s preview=%s",
-                    attempt + 1,
-                    self.browser_retries + 1,
-                    query,
-                    exc,
-                    exc.response_preview,
-                )
-            except PlaywrightError as exc:
-                last_error = exc
-                logger.warning(
-                    "Transient Playwright collector failure attempt=%s/%s query=%s: %s",
-                    attempt + 1,
-                    self.browser_retries + 1,
-                    query,
-                    exc,
-                )
-                if attempt >= self.browser_retries:
-                    raise
-            time.sleep(0.15 * (attempt + 1))
-        raise last_error  # pragma: no cover
 
     def _collect_sync(self, query: SearchQuery) -> Tuple[List[Job], int, str]:
         cached = search_cache.get(query)
@@ -88,25 +48,27 @@ class CollectionService:
                 jobs, total = cached
                 return jobs, total, "cache"
 
-            if not self._live_slots.acquire(blocking=False):
-                stale = search_cache.get(query, allow_stale=True)
-                if stale is not None:
-                    jobs, total = stale
-                    return jobs, total, "stale-cache"
-                self._live_slots.acquire()
+            # Do not run multiple anonymous browsers concurrently. If another
+            # request owns the browser, wait for it rather than creating a
+            # burst that makes Naukri throttle the Railway IP.
+            self._live_slots.acquire()
             try:
                 cached = search_cache.get(query)
                 if cached is not None:
                     jobs, total = cached
                     return jobs, total, "cache"
                 try:
-                    jobs, total = self._run_live_with_retry(query)
+                    jobs, total = self.naukri._search_sync(query)
                     search_cache.set(query, (jobs, total))
                     return jobs, total, "live"
                 except Exception:
+                    # Availability is more useful than turning a transient
+                    # upstream block into a public 503. Redis retains entries
+                    # for the stale window specifically for this case.
                     stale = search_cache.get(query, allow_stale=True)
                     if stale is not None:
                         jobs, total = stale
+                        logger.warning("Serving stale cache after live collector failure query=%s", query)
                         return jobs, total, "stale-cache"
                     raise
             finally:
