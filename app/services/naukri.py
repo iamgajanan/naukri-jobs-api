@@ -5,12 +5,8 @@ from typing import List, Tuple
 from app.schemas.jobs import Job, SearchQuery
 from app.services.browser import BrowserManager
 from app.utils.normalizers import (
-    experience_matches,
-    freshness_matches,
-    normalize_employment_type,
-    normalize_experience,
-    normalize_salary,
-    normalize_work_mode,
+    experience_matches, freshness_matches, normalize_employment_type,
+    normalize_experience, normalize_salary, normalize_work_mode,
 )
 
 CARD_SELECTORS = ["div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.jobTuple"]
@@ -33,6 +29,8 @@ class NaukriUpstreamError(Exception):
 
 class NaukriService:
     MAX_PAGES = 6
+    NAUKRI_PAGE_SIZE = 20
+    MAX_LIMIT = 50
 
     @staticmethod
     def _slugify(value):
@@ -55,8 +53,7 @@ class NaukriService:
 
     @staticmethod
     def _all_text(card, selectors):
-        values = []
-        seen = set()
+        values, seen = [], set()
         for selector in selectors:
             try:
                 locator = card.locator(selector)
@@ -81,9 +78,12 @@ class NaukriService:
             text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
         except Exception:
             text = ""
-        markers = ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")
-        if any(marker in text for marker in markers):
+        if any(marker in text for marker in ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")):
             raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected; collector will not bypass it")
+
+    @staticmethod
+    def _page_url(base_path, page_num):
+        return base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
 
     def _search_sync(self, query):
         browser = BrowserManager()
@@ -100,15 +100,14 @@ class NaukriService:
                 "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
                 if location_slug else "https://www.naukri.com/{}-jobs".format(keyword_slug)
             )
-            target = min(query.limit, 50)
+            target = max(1, min(query.limit, self.MAX_LIMIT))
             start_page = max(query.page, 1)
-            # Filters can remove cards, so inspect a few extra pages to fill the requested limit.
-            pages_to_scan = 1 if not (query.experience or query.freshness or query.work_mode) else self.MAX_PAGES
-            last_page = start_page + pages_to_scan - 1
+            minimum_pages = max(1, (target + self.NAUKRI_PAGE_SIZE - 1) // self.NAUKRI_PAGE_SIZE)
+            filtered = query.experience is not None or query.freshness is not None or query.work_mode is not None
+            pages_to_scan = self.MAX_PAGES if filtered else min(minimum_pages, self.MAX_PAGES)
 
-            for page_num in range(start_page, last_page + 1):
-                url = base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
-                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            for page_num in range(start_page, start_page + pages_to_scan):
+                response = page.goto(self._page_url(base_path, page_num), wait_until="domcontentloaded", timeout=30000)
                 if response is not None and response.status >= 400:
                     preview = None
                     try:
@@ -129,6 +128,8 @@ class NaukriService:
                         cards = candidate
                         break
                 if cards is None or cards.count() == 0:
+                    if jobs:
+                        break
                     raise NaukriUpstreamError("Naukri returned no recognizable job cards; page structure may have changed")
 
                 for index in range(cards.count()):
@@ -145,10 +146,7 @@ class NaukriService:
                     posted = self._first_match(card, POSTED_SELECTORS)
                     description = self._first_match(card, DESCRIPTION_SELECTORS)
                     experience = normalize_experience(experience_text)
-
-                    if not experience_matches(experience, query.experience):
-                        continue
-                    if not freshness_matches(posted, query.freshness):
+                    if not experience_matches(experience, query.experience) or not freshness_matches(posted, query.freshness):
                         continue
 
                     link = ""
@@ -167,7 +165,8 @@ class NaukriService:
                     if not job_id:
                         match = re.search(r"-(\d{6,})(?:\?|$)", link)
                         job_id = match.group(1) if match else link
-                    if job_id in seen:
+                    dedupe_key = str(job_id or link).strip().lower()
+                    if dedupe_key in seen:
                         continue
 
                     text_blob = card.text_content() or ""
@@ -175,21 +174,18 @@ class NaukriService:
                     if query.work_mode and work_mode != query.work_mode:
                         continue
 
-                    seen.add(job_id)
+                    seen.add(dedupe_key)
                     jobs.append(Job(
                         id=str(job_id), title=title, company=company, location=location,
-                        experience=experience, salary=normalize_salary(salary_text),
-                        work_mode=work_mode,
+                        experience=experience, salary=normalize_salary(salary_text), work_mode=work_mode,
                         employment_type=normalize_employment_type(text_blob),
-                        skills=self._all_text(card, SKILL_SELECTORS),
-                        description=description, posted_at=posted, job_url=link,
+                        skills=self._all_text(card, SKILL_SELECTORS), description=description,
+                        posted_at=posted, job_url=link,
                     ))
-
                 if len(jobs) >= target:
                     break
 
-            # A valid filtered search may legitimately have zero matches.
-            return jobs, len(jobs)
+            return jobs[:target], min(len(jobs), target)
         finally:
             browser.close()
 
