@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.collector import collection_service
 
 client = TestClient(app)
 
@@ -10,11 +11,14 @@ def test_search_requires_keyword():
     assert response.status_code == 422
 
 
-def test_limit_100_is_accepted():
-    # Validation should accept 100. Collector execution is intentionally not
-    # exercised by this validation-only test.
-    response = client.get("/v1/jobs/search", params={"keyword": "react", "limit": 101})
-    assert response.status_code == 422
+def test_limit_100_is_accepted(monkeypatch):
+    async def fake_search(query):
+        return [], 0, "live"
+
+    monkeypatch.setattr(collection_service, "search", fake_search)
+    response = client.get("/v1/jobs/search", params={"keyword": "react", "limit": 100})
+    assert response.status_code == 200
+    assert response.json()["limit"] == 100
 
 
 def test_limit_above_100_is_rejected():
