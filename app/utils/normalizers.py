@@ -4,14 +4,26 @@ from typing import Optional
 from app.schemas.jobs import Experience, Salary
 
 
+_EXPERIENCE_RANGE = re.compile(r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\s*(?:yrs?|years?)\b", re.I)
+_EXPERIENCE_SINGLE = re.compile(r"\b(\d{1,2})\+?\s*(?:yrs?|years?)\b", re.I)
+
+
 def normalize_experience(value: Optional[str]) -> Experience:
     if not value:
         return Experience()
 
-    numbers = [int(n) for n in re.findall(r"\d+", value)]
-    minimum = numbers[0] if numbers else None
-    maximum = numbers[1] if len(numbers) > 1 else minimum
-    return Experience(text=value.strip(), min=minimum, max=maximum)
+    text = value.strip()
+    match = _EXPERIENCE_RANGE.search(text)
+    if match:
+        return Experience(text=text, min=int(match.group(1)), max=int(match.group(2)))
+
+    match = _EXPERIENCE_SINGLE.search(text)
+    if match:
+        years = int(match.group(1))
+        return Experience(text=text, min=years, max=years)
+
+    # Do not interpret dates such as "08 Aug" as eight years of experience.
+    return Experience(text=text, min=None, max=None)
 
 
 def _to_rupees(number: float, unit: Optional[str]) -> int:
@@ -45,11 +57,11 @@ def normalize_salary(value: Optional[str]) -> Salary:
 def normalize_work_mode(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
-    lowered = value.strip().lower()
-    if "hybrid" in lowered:
+    lowered = " ".join(value.strip().lower().split())
+    if re.search(r"\bhybrid\b", lowered):
         return "hybrid"
-    if "remote" in lowered or "work from home" in lowered or "wfh" in lowered:
+    if re.search(r"\bremote\b|work\s+from\s+home|\bwfh\b", lowered):
         return "remote"
-    if "office" in lowered or "onsite" in lowered or "on-site" in lowered:
+    if re.search(r"\bonsite\b|\bon-site\b|work\s+from\s+office|\bwfo\b", lowered):
         return "onsite"
-    return lowered
+    return None
