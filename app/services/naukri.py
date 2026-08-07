@@ -34,9 +34,9 @@ class NaukriUpstreamError(Exception):
 
 
 class NaukriService:
-    MAX_PAGES = 6
+    MAX_PAGES = 10
     NAUKRI_PAGE_SIZE = 20
-    MAX_LIMIT = 50
+    MAX_LIMIT = 100
 
     @staticmethod
     def _slugify(value):
@@ -77,7 +77,6 @@ class NaukriService:
 
     @staticmethod
     def _page_snapshot(page):
-        """Return small diagnostics only; never stores cookies/profile/session data."""
         try:
             title = page.title() or ""
         except Exception:
@@ -123,9 +122,6 @@ class NaukriService:
                     return candidate
             except Exception:
                 continue
-
-        # Layout-independent fallback: find real job-detail links and use their
-        # nearest useful container. This is selector resilience, not a bypass.
         try:
             links = page.locator("a[href*='job-listings']")
             if links.count() > 0:
@@ -166,9 +162,6 @@ class NaukriService:
                         status_code=response.status,
                         response_preview=self._page_snapshot(page),
                     )
-
-                # Give the client-rendered job list a chance to appear, without
-                # making any assumption that a particular selector is present.
                 try:
                     page.wait_for_function(
                         "() => document.querySelectorAll(\"a[href*='job-listings']\").length > 0",
