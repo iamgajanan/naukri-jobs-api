@@ -1,134 +1,182 @@
-from typing import Dict, List, Set, Tuple, Union
-from urllib.parse import quote_plus
-
-import httpx
+import asyncio
+import re
+from typing import List, Tuple
 
 from app.schemas.jobs import Job, SearchQuery
+from app.services.browser import BrowserManager
 from app.utils.normalizers import normalize_experience, normalize_salary, normalize_work_mode
+
+CARD_SELECTORS = [
+    "div.srp-jobtuple-wrapper",
+    "div.cust-job-tuple",
+    "article.jobTuple",
+]
+TITLE_SELECTORS = ["a.title", ".title.ellipsis"]
+COMPANY_SELECTORS = ["a.comp-name", ".comp-name", ".subTitle"]
+LOCATION_SELECTORS = ["span.locWdth", ".loc-wrap span", ".location"]
+EXPERIENCE_SELECTORS = ["span.expwdth", ".exp-wrap span", ".experience"]
+SALARY_SELECTORS = ["span.sal-wrap span", ".sal", ".salary"]
+POSTED_SELECTORS = ["span.job-post-day", ".job-post-day"]
+DESCRIPTION_SELECTORS = ["span.job-desc", ".job-description"]
 
 
 class NaukriUpstreamError(Exception):
-    def __init__(self, message: str, status_code=None, response_preview=None) -> None:
+    def __init__(self, message, status_code=None, response_preview=None):
         super().__init__(message)
         self.status_code = status_code
         self.response_preview = response_preview
 
 
 class NaukriService:
-    SEARCH_URL = "https://www.naukri.com/jobapi/v3/search"
+    """Browser-backed Naukri public-search scraper.
 
-    def __init__(self, timeout: float = 15.0) -> None:
-        self.timeout = timeout
+    This intentionally does not solve or bypass CAPTCHA. If Naukri presents a
+    challenge/login page, the request fails explicitly instead of pretending
+    that zero jobs were found.
+    """
 
-    def _headers(self, query: SearchQuery) -> Dict[str, str]:
-        keyword = quote_plus(query.keyword)
-        location = quote_plus(query.location or "")
-        referer = "https://www.naukri.com/{}-jobs-in-{}".format(keyword, location)
-        return {
-            "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9",
-            "appid": "109",
-            "clientid": "d3skt0p",
-            "content-type": "application/json",
-            "referer": referer,
-            "systemid": "109",
-            "user-agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        }
+    MAX_PAGES = 6
 
-    def _params(self, query: SearchQuery) -> Dict[str, Union[str, int]]:
-        params = {
-            "noOfResults": query.limit,
-            "urlType": "search_by_key_loc" if query.location else "search_by_keyword",
-            "searchType": "adv",
-            "keyword": query.keyword,
-            "pageNo": query.page,
-            "src": "directSearch",
-        }
-        if query.location:
-            params["location"] = query.location
-        if query.experience is not None:
-            params["experience"] = query.experience
-        if query.freshness is not None:
-            params["jobAge"] = query.freshness
-        return params
+    @staticmethod
+    def _slugify(value):
+        value = (value or "").strip().lower()
+        value = re.sub(r"[^a-z0-9]+", "-", value)
+        return value.strip("-")
+
+    @staticmethod
+    def _first_match(card, selectors):
+        for selector in selectors:
+            try:
+                locator = card.locator(selector)
+                if locator.count() > 0:
+                    text = (locator.first.text_content(timeout=1000) or "").strip()
+                    if text:
+                        return text
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _detect_challenge(page):
+        url = (page.url or "").lower()
+        if "/nlogin" in url or "/login" in url:
+            raise NaukriUpstreamError("Naukri requires login/session verification")
+        try:
+            text = ((page.title() or "") + "\n" + (page.locator("body").inner_text(timeout=1500) or "")).lower()
+        except Exception:
+            text = ""
+        markers = ("captcha", "recaptcha", "verify you are human", "security verification", "unusual activity")
+        if any(marker in text for marker in markers):
+            raise NaukriUpstreamError("Naukri CAPTCHA/challenge detected")
+
+    def _search_sync(self, query):
+        browser = BrowserManager(profile_name="browser-data-naukri")
+        jobs = []
+        seen = set()
+        try:
+            page = browser.launch(headless=True)
+            keyword_slug = self._slugify(query.keyword)
+            location_slug = self._slugify(query.location)
+            if not keyword_slug:
+                raise NaukriUpstreamError("keyword is required")
+
+            if location_slug:
+                base_path = "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
+            else:
+                base_path = "https://www.naukri.com/{}-jobs".format(keyword_slug)
+
+            target = min(query.limit, 50)
+            start_page = max(query.page, 1)
+            last_page = min(start_page + self.MAX_PAGES - 1, start_page + ((target - 1) // 20))
+
+            for page_num in range(start_page, last_page + 1):
+                url = base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if response is not None and response.status >= 400:
+                    raise NaukriUpstreamError(
+                        "Naukri search page returned HTTP {}".format(response.status),
+                        status_code=response.status,
+                    )
+                page.wait_for_timeout(2500)
+                self._detect_challenge(page)
+
+                cards = None
+                for selector in CARD_SELECTORS:
+                    candidate = page.locator(selector)
+                    if candidate.count() > 0:
+                        cards = candidate
+                        break
+                if cards is None or cards.count() == 0:
+                    break
+
+                page_new = 0
+                for index in range(cards.count()):
+                    if len(jobs) >= target:
+                        break
+                    card = cards.nth(index)
+                    title = self._first_match(card, TITLE_SELECTORS)
+                    if not title:
+                        continue
+                    company = self._first_match(card, COMPANY_SELECTORS)
+                    location = self._first_match(card, LOCATION_SELECTORS) or query.location
+                    experience_text = self._first_match(card, EXPERIENCE_SELECTORS)
+                    salary_text = self._first_match(card, SALARY_SELECTORS)
+                    posted = self._first_match(card, POSTED_SELECTORS)
+                    description = self._first_match(card, DESCRIPTION_SELECTORS)
+
+                    link = ""
+                    try:
+                        title_link = card.locator("a.title")
+                        if title_link.count() > 0:
+                            link = title_link.first.get_attribute("href", timeout=1000) or ""
+                    except Exception:
+                        pass
+                    if not link:
+                        try:
+                            anchors = card.locator("a")
+                            if anchors.count() > 0:
+                                link = anchors.first.get_attribute("href", timeout=1000) or ""
+                        except Exception:
+                            pass
+                    if link.startswith("/"):
+                        link = "https://www.naukri.com" + link
+                    if not link:
+                        continue
+
+                    job_id = card.get_attribute("data-job-id") or ""
+                    if not job_id:
+                        match = re.search(r"-(\d{6,})(?:\?|$)", link)
+                        job_id = match.group(1) if match else link
+                    if job_id in seen:
+                        continue
+                    seen.add(job_id)
+
+                    text_blob = (card.text_content() or "").lower()
+                    work_mode = normalize_work_mode(text_blob)
+                    if query.work_mode and work_mode != query.work_mode:
+                        continue
+
+                    jobs.append(Job(
+                        id=str(job_id),
+                        title=title,
+                        company=company,
+                        location=location,
+                        experience=normalize_experience(experience_text),
+                        salary=normalize_salary(salary_text),
+                        work_mode=work_mode,
+                        skills=[],
+                        description=description,
+                        posted_at=posted,
+                        job_url=link,
+                    ))
+                    page_new += 1
+
+                if len(jobs) >= target or page_new == 0:
+                    break
+
+            return jobs, len(jobs)
+        finally:
+            browser.close()
 
     async def search(self, query: SearchQuery) -> Tuple[List[Job], int]:
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.get(
-                    self.SEARCH_URL,
-                    params=self._params(query),
-                    headers=self._headers(query),
-                )
-        except httpx.HTTPError as exc:
-            raise NaukriUpstreamError("Could not connect to Naukri: {}".format(type(exc).__name__)) from exc
-
-        if response.status_code >= 400:
-            preview = response.text[:300].replace("\n", " ")
-            raise NaukriUpstreamError(
-                "Naukri returned HTTP {}".format(response.status_code),
-                status_code=response.status_code,
-                response_preview=preview,
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            preview = response.text[:300].replace("\n", " ")
-            raise NaukriUpstreamError(
-                "Naukri returned a non-JSON response",
-                status_code=response.status_code,
-                response_preview=preview,
-            ) from exc
-
-        raw_jobs = payload.get("jobDetails") or payload.get("jobs") or []
-        jobs = []  # type: List[Job]
-        seen = set()  # type: Set[str]
-
-        for raw in raw_jobs:
-            job_id = str(raw.get("jobId") or raw.get("id") or "").strip()
-            url = raw.get("jdURL") or raw.get("jobUrl") or raw.get("url")
-            if url and str(url).startswith("/"):
-                url = "https://www.naukri.com{}".format(url)
-            if not job_id:
-                job_id = str(url or "").strip()
-            if not job_id or not url or job_id in seen:
-                continue
-            seen.add(job_id)
-
-            skills = raw.get("tagsAndSkills") or raw.get("skills") or []
-            if isinstance(skills, str):
-                skills = [item.strip() for item in skills.split(",") if item.strip()]
-
-            placeholders = raw.get("placeholders") or []
-            location = raw.get("location")
-            if placeholders and isinstance(placeholders[0], dict):
-                location = placeholders[0].get("label") or location
-
-            jobs.append(
-                Job(
-                    id=job_id,
-                    title=raw.get("title") or raw.get("jobTitle") or "Unknown",
-                    company=raw.get("companyName") or raw.get("company"),
-                    location=location,
-                    experience=normalize_experience(raw.get("experienceText") or raw.get("experience")),
-                    salary=normalize_salary(raw.get("salaryText") or raw.get("salary")),
-                    work_mode=normalize_work_mode(raw.get("workMode") or raw.get("wfhType")),
-                    employment_type=raw.get("employmentType"),
-                    skills=skills if isinstance(skills, list) else [],
-                    description=raw.get("jobDescription") or raw.get("description"),
-                    posted_at=raw.get("createdDate") or raw.get("footerPlaceholderLabel") or raw.get("postedDate"),
-                    job_url=str(url),
-                )
-            )
-
-        total = payload.get("noOfJobs") or payload.get("totalJobs") or payload.get("totalResults") or len(jobs)
-        try:
-            total = int(total)
-        except (TypeError, ValueError):
-            total = len(jobs)
-        return jobs, total
+        return await asyncio.to_thread(self._search_sync, query)
