@@ -4,7 +4,14 @@ from typing import List, Tuple
 
 from app.schemas.jobs import Job, SearchQuery
 from app.services.browser import BrowserManager
-from app.utils.normalizers import normalize_experience, normalize_salary, normalize_work_mode
+from app.utils.normalizers import (
+    experience_matches,
+    freshness_matches,
+    normalize_employment_type,
+    normalize_experience,
+    normalize_salary,
+    normalize_work_mode,
+)
 
 CARD_SELECTORS = ["div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.jobTuple"]
 TITLE_SELECTORS = ["a.title", ".title.ellipsis"]
@@ -14,6 +21,7 @@ EXPERIENCE_SELECTORS = ["span.expwdth", ".exp-wrap span", ".experience"]
 SALARY_SELECTORS = ["span.sal-wrap span", ".sal", ".salary"]
 POSTED_SELECTORS = ["span.job-post-day", ".job-post-day"]
 DESCRIPTION_SELECTORS = ["span.job-desc", ".job-description"]
+SKILL_SELECTORS = [".tags-gt .tag-li", ".tags-gt li", ".jobTupleFooter .tag-li", ".key-skill"]
 
 
 class NaukriUpstreamError(Exception):
@@ -24,13 +32,6 @@ class NaukriUpstreamError(Exception):
 
 
 class NaukriService:
-    """Anonymous browser-backed collector for public Naukri search pages.
-
-    It does not load account credentials or saved cookies and does not attempt
-    to solve/bypass CAPTCHA. Challenges are reported to the collection layer so
-    cached/indexed data can be served instead.
-    """
-
     MAX_PAGES = 6
 
     @staticmethod
@@ -53,6 +54,25 @@ class NaukriService:
         return None
 
     @staticmethod
+    def _all_text(card, selectors):
+        values = []
+        seen = set()
+        for selector in selectors:
+            try:
+                locator = card.locator(selector)
+                for index in range(locator.count()):
+                    text = (locator.nth(index).text_content(timeout=500) or "").strip()
+                    key = text.lower()
+                    if text and key not in seen:
+                        seen.add(key)
+                        values.append(text)
+                if values:
+                    break
+            except Exception:
+                continue
+        return values
+
+    @staticmethod
     def _detect_challenge(page):
         url = (page.url or "").lower()
         if "/nlogin" in url or "/login" in url:
@@ -70,8 +90,6 @@ class NaukriService:
         jobs = []  # type: List[Job]
         seen = set()
         try:
-            # BrowserManager decides headless/headed from NAUKRI_HEADLESS.
-            # Production default remains headless; local diagnostics can set false.
             page = browser.launch()
             keyword_slug = self._slugify(query.keyword)
             location_slug = self._slugify(query.location)
@@ -80,12 +98,13 @@ class NaukriService:
 
             base_path = (
                 "https://www.naukri.com/{}-jobs-in-{}".format(keyword_slug, location_slug)
-                if location_slug
-                else "https://www.naukri.com/{}-jobs".format(keyword_slug)
+                if location_slug else "https://www.naukri.com/{}-jobs".format(keyword_slug)
             )
             target = min(query.limit, 50)
             start_page = max(query.page, 1)
-            last_page = min(start_page + self.MAX_PAGES - 1, start_page + ((target - 1) // 20))
+            # Filters can remove cards, so inspect a few extra pages to fill the requested limit.
+            pages_to_scan = 1 if not (query.experience or query.freshness or query.work_mode) else self.MAX_PAGES
+            last_page = start_page + pages_to_scan - 1
 
             for page_num in range(start_page, last_page + 1):
                 url = base_path if page_num == 1 else "{}-{}".format(base_path, page_num)
@@ -98,8 +117,7 @@ class NaukriService:
                         pass
                     raise NaukriUpstreamError(
                         "Naukri search page returned HTTP {}".format(response.status),
-                        status_code=response.status,
-                        response_preview=preview,
+                        status_code=response.status, response_preview=preview,
                     )
                 page.wait_for_timeout(2500)
                 self._detect_challenge(page)
@@ -113,7 +131,6 @@ class NaukriService:
                 if cards is None or cards.count() == 0:
                     raise NaukriUpstreamError("Naukri returned no recognizable job cards; page structure may have changed")
 
-                page_new = 0
                 for index in range(cards.count()):
                     if len(jobs) >= target:
                         break
@@ -127,6 +144,12 @@ class NaukriService:
                     salary_text = self._first_match(card, SALARY_SELECTORS)
                     posted = self._first_match(card, POSTED_SELECTORS)
                     description = self._first_match(card, DESCRIPTION_SELECTORS)
+                    experience = normalize_experience(experience_text)
+
+                    if not experience_matches(experience, query.experience):
+                        continue
+                    if not freshness_matches(posted, query.freshness):
+                        continue
 
                     link = ""
                     try:
@@ -146,27 +169,26 @@ class NaukriService:
                         job_id = match.group(1) if match else link
                     if job_id in seen:
                         continue
-                    seen.add(job_id)
 
-                    text_blob = (card.text_content() or "").lower()
+                    text_blob = card.text_content() or ""
                     work_mode = normalize_work_mode(text_blob)
                     if query.work_mode and work_mode != query.work_mode:
                         continue
 
+                    seen.add(job_id)
                     jobs.append(Job(
                         id=str(job_id), title=title, company=company, location=location,
-                        experience=normalize_experience(experience_text),
-                        salary=normalize_salary(salary_text), work_mode=work_mode,
-                        skills=[], description=description, posted_at=posted,
-                        job_url=link,
+                        experience=experience, salary=normalize_salary(salary_text),
+                        work_mode=work_mode,
+                        employment_type=normalize_employment_type(text_blob),
+                        skills=self._all_text(card, SKILL_SELECTORS),
+                        description=description, posted_at=posted, job_url=link,
                     ))
-                    page_new += 1
 
-                if len(jobs) >= target or page_new == 0:
+                if len(jobs) >= target:
                     break
 
-            if not jobs:
-                raise NaukriUpstreamError("Naukri returned no usable jobs for this query")
+            # A valid filtered search may legitimately have zero matches.
             return jobs, len(jobs)
         finally:
             browser.close()
