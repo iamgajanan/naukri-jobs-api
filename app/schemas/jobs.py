@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -7,40 +7,40 @@ WorkMode = Literal["remote", "hybrid", "onsite"]
 
 
 class Experience(BaseModel):
-    text: str | None = None
-    min: int | None = None
-    max: int | None = None
+    text: Optional[str] = None
+    min: Optional[int] = None
+    max: Optional[int] = None
 
 
 class Salary(BaseModel):
-    text: str | None = None
-    min: int | None = None
-    max: int | None = None
-    currency: str | None = "INR"
+    text: Optional[str] = None
+    min: Optional[int] = None
+    max: Optional[int] = None
+    currency: Optional[str] = "INR"
 
 
 class Job(BaseModel):
     id: str
     title: str
-    company: str | None = None
-    location: str | None = None
+    company: Optional[str] = None
+    location: Optional[str] = None
     experience: Experience = Field(default_factory=Experience)
     salary: Salary = Field(default_factory=Salary)
-    work_mode: str | None = None
-    employment_type: str | None = None
-    skills: list[str] = Field(default_factory=list)
-    description: str | None = None
-    posted_at: str | None = None
+    work_mode: Optional[str] = None
+    employment_type: Optional[str] = None
+    skills: List[str] = Field(default_factory=list)
+    description: Optional[str] = None
+    posted_at: Optional[str] = None
     job_url: str
     source: str = "naukri"
 
 
 class SearchQuery(BaseModel):
     keyword: str
-    location: str | None = None
-    experience: int | None = None
-    freshness: int | None = None
-    work_mode: WorkMode | None = None
+    location: Optional[str] = None
+    experience: Optional[int] = None
+    freshness: Optional[int] = None
+    work_mode: Optional[WorkMode] = None
     page: int = 1
     limit: int = 20
 
@@ -51,4 +51,4 @@ class SearchResponse(BaseModel):
     total_results: int
     page: int
     limit: int
-    jobs: list[Job]
+    jobs: List[Job]
