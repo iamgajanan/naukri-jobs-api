@@ -10,11 +10,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Use the pinned Playwright image so the browser binary and Python package
-# stay aligned in production. Railway runs this Dockerfile directly.
+# Keep the Playwright runtime image aligned with the pinned Python package.
+# The production collector runs headless Chromium; no Xvfb is required.
 COPY app ./app
 COPY scripts ./scripts
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway injects PORT (currently 8080 for this service). Use a shell so the
+# environment variable is expanded at container start.
+CMD ["bash", "-lc", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
